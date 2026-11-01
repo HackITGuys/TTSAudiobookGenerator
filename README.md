@@ -1,1 +1,109 @@
 # TTSAudiobookGenerator
+
+An offline Rust tool that converts PDF, EPUB and DOCX books into chaptered audiobooks (M4B / MP3) using Mistral TTS.
+
+**Status:** stage 1 (text extraction pipeline) is implemented. TTS synthesis and audio assembly are next.
+
+## Pipeline
+
+```
+ PDF / EPUB / DOCX / MD
+          │  extract/      format readers → blocks (heading, paragraph, list item, scene break) + TOC + metadata
+          ▼
+       clean.rs           remove footnote markers, citations, URLs, ligatures, markup, emoji
+          ▼
+     chapters.rs          split into chapters (source TOC → headings → "Chapter X" patterns)
+          ▼
+ segment.rs / ssml.rs     ≤300-word plain-text TTS segments with pauses, plus SSML per chapter
+          ▼
+      output.rs           out/<book>/book.json, chapters/NNN-title.{txt,ssml}, cover image
+```
+
+Mistral's TTS (`voxtral-mini-tts-2603`) takes **plain text only** and works best with fewer than about 300 words per request. The TTS stage should therefore use `segments` from `book.json`. Each segment has a `pause_after_ms` that the audio stage inserts as silence. The `.ssml` files are for engines that support SSML.
+
+## Usage
+
+Requires a Rust toolchain (stable, edition 2024).
+
+```sh
+cargo run --release -- extract path/to/book.epub -o out
+```
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `-o, --out <DIR>` | `out` | Output root. The book is written to `<DIR>/<title-slug>/`. |
+| `--max-segment-words <N>` | `300` | Maximum words per TTS segment. |
+| `--no-ssml` | | Skip the `.ssml` files. |
+| `--keep-all` | | Keep chapters that are skipped by default: Contents, Index, Notes and similar. |
+| `--ignore-toc` | | Ignore the book's table of contents and split on headings instead. |
+
+The command prints a chapter table (words, estimated minutes, segment count) so you can check the result quickly.
+
+### Output
+
+```
+out/the-keeper-of-skarvoy-light/
+├── book.json            metadata + chapters + TTS segments (contract for later stages)
+├── cover.jpg            EPUB only, when the book has a cover
+└── chapters/
+    ├── 001-part-one-chapter-1-the-fog.txt
+    ├── 001-part-one-chapter-1-the-fog.ssml
+    └── ...
+```
+
+`book.json` (abridged):
+
+```json
+{
+  "generator": "tts-audiobook-generator 0.1.0",
+  "source_file": "sample.epub",
+  "metadata": { "title": "The Keeper of Skarvøy Light", "authors": ["Ingrid Solberg"], "language": "en", ... },
+  "chapters": [
+    {
+      "index": 1,
+      "title": "Part One — Chapter 1: The Fog",
+      "word_count": 360,
+      "est_duration_secs": 139,
+      "text_file": "chapters/001-part-one-chapter-1-the-fog.txt",
+      "ssml_file": "chapters/001-part-one-chapter-1-the-fog.ssml",
+      "segments": [
+        { "text": "Part One — Chapter 1: The Fog.", "words": 7, "pause_after_ms": 1500 },
+        { "text": "The fog came in from the west ...", "words": 213, "pause_after_ms": 600 }
+      ]
+    }
+  ]
+}
+```
+
+## How extraction works
+
+- **EPUB:** reads OPF metadata, spine order, and the EPUB 3 nav (or EPUB 2 NCX) TOC, mapped to anchors. Footnote references and bodies are dropped using `epub:type`, `role` and `class`.
+- **DOCX:** reads heading levels from `styles.xml`, so localised styles such as "Overskrift 1" work. Lists come from `numbering.xml` and metadata from `docProps/core.xml`. Word's own TOC, deleted text, field codes and note references are skipped.
+- **PDF:** rebuilds the layout from glyph positions and font sizes:
+  - headings are lines larger than the body text;
+  - running headers, footers and page numbers are removed, along with footnotes (small type at the page bottom) and superscript note markers;
+  - hyphenated line breaks are rejoined, and paragraphs are detected from gaps and indents;
+  - PDF bookmarks are used as the TOC when present.
+- **Markdown / TXT:** `#` headings, lists, `* * *` scene breaks, and YAML front matter for metadata.
+
+Chapter splitting chooses its split level automatically. "Part" pages are merged into the first chapter that follows ("Part One — Chapter 1: The Fog"). Contents, Index and Notes pages, and short front matter, are skipped.
+
+## Development
+
+```sh
+cargo test                                   # unit + integration tests
+cargo clippy --all-targets -- -D warnings
+cargo fmt
+```
+
+The integration tests in `tests/pipeline.rs` run the same sample book in all four formats and check metadata, chapter titles, lists, scene breaks, cleanup and segment limits. The sample book's source is `tests/fixtures/sample.md`. To regenerate the PDF/EPUB/DOCX fixtures, run `tests/fixtures/generate.ps1`, which needs pandoc and pdflatex.
+
+## Roadmap
+
+1. ~~Text extraction, chapter splitting, TTS preprocessing~~
+2. Mistral TTS synthesis of segments: one configured voice, or a voice chosen by the author's gender.
+3. Audio assembly with ffmpeg:
+   - an M4B/MP3 with chapter markers, book metadata and cover art;
+   - a watermark marking the file as AI-generated and for personal use only;
+   - a spoken disclaimer: "generated by AI with this project and Mistral's voice model; for personal use only; the author owns all rights".
+4. Later: a separate voice for each character.
