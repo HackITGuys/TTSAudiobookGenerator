@@ -6,10 +6,16 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 10
+    # A dependency goes into the first group it matches. Major bumps match no
+    # group and get a PR each.
     groups:
-      # One PR for all compatible bumps; breaking (major) bumps get their own.
-      cargo-minor-and-patch:
-        update-types: [minor, patch]
+      # pdf-extract's API takes lopdf types, so both must move together.
+      pdf:
+        patterns: [lopdf, pdf-extract]
+      cargo-minor:
+        update-types: [minor]
+      cargo-patch:
+        update-types: [patch]
     commit-message:
       prefix: deps
 
