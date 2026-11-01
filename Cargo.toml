@@ -15,7 +15,7 @@ base64 = "0.23.1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15.7"
 euclid = "0.20"
-lopdf = "0.42"
+lopdf = "0.46"
 pdf-extract = "0.10"
 regex = "1"
 roxmltree = "0.21"
