@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 
 use crate::model::{Block, BlockKind};
+use crate::sanitize::sanitize_text;
 
 macro_rules! re {
     ($name:ident, $pat:expr) => {
@@ -65,9 +66,29 @@ const LIGATURES: &[(char, &str)] = &[
     ('ﬆ', "st"),
 ];
 
+/// Which optional cleaning steps to apply.
+#[derive(Debug, Clone, Copy)]
+pub struct CleanOptions {
+    /// Replace hashes, long numbers, binary, base64 and words over 32
+    /// characters with a spoken placeholder (see `sanitize`).
+    pub sanitize: bool,
+}
+
+impl Default for CleanOptions {
+    fn default() -> Self {
+        Self { sanitize: true }
+    }
+}
+
+/// Clean a single piece of text for narration with the default options.
+/// Returns an empty string if nothing speakable is left.
+pub fn clean_text(input: &str) -> String {
+    clean_text_with(input, CleanOptions::default())
+}
+
 /// Clean a single piece of text for narration. Returns an empty string if
 /// nothing speakable is left.
-pub fn clean_text(input: &str) -> String {
+pub fn clean_text_with(input: &str, opts: CleanOptions) -> String {
     let mut s = String::with_capacity(input.len());
     for c in input.chars() {
         match LIGATURES.iter().find(|(l, _)| *l == c) {
@@ -91,6 +112,12 @@ pub fn clean_text(input: &str) -> String {
     let s = CITATION.replace_all(&s, "");
     let s = TRAILING_MARKS.replace_all(&s, "$1$2");
     let s = URL.replace_all(&s, |c: &Captures| url_to_domain(&c[0]));
+    // Before markup stripping, so the placeholder keeps the original's tail.
+    let s = if opts.sanitize {
+        sanitize_text(&s)
+    } else {
+        s.into_owned()
+    };
     let s = EMOJI.replace_all(&s, "");
     let s = MARKUP_CHARS.replace_all(&s, "");
     let s = EMPTY_PARENS.replace_all(&s, "");
@@ -120,13 +147,13 @@ fn url_to_domain(url: &str) -> String {
 /// Clean every block, dropping the ones left empty. Anchors of dropped
 /// blocks are carried over to the next surviving block so TOC targets still
 /// resolve.
-pub fn clean_blocks(blocks: Vec<Block>) -> Vec<Block> {
+pub fn clean_blocks(blocks: Vec<Block>, opts: CleanOptions) -> Vec<Block> {
     let mut out: Vec<Block> = Vec::with_capacity(blocks.len());
     let mut pending: Option<Block> = None;
 
     for mut block in blocks {
         if block.kind != BlockKind::SceneBreak {
-            block.text = clean_text(&block.text);
+            block.text = clean_text_with(&block.text, opts);
         }
         let empty = block.kind != BlockKind::SceneBreak && block.text.is_empty();
 
@@ -216,6 +243,19 @@ mod tests {
     }
 
     #[test]
+    fn sanitises_codes_before_markup_stripping() {
+        assert_eq!(
+            clean_text("Run `sha1sum` -> **3f786850e387550fdab836ed7e6dc881de23001b**."),
+            "Run sha1sum -> long non-textual string ending in 2 3 0 0 1 b."
+        );
+        let off = CleanOptions { sanitize: false };
+        assert_eq!(
+            clean_text_with("hash 3f786850e387550fdab836ed7e6dc881de23001b", off),
+            "hash 3f786850e387550fdab836ed7e6dc881de23001b"
+        );
+    }
+
+    #[test]
     fn clean_blocks_moves_anchors_forward() {
         let mut empty = Block::paragraph("[1]");
         empty.anchors = vec!["ch1".into()];
@@ -226,7 +266,7 @@ mod tests {
             Block::scene_break(),
             Block::scene_break(),
         ];
-        let out = clean_blocks(blocks);
+        let out = clean_blocks(blocks, CleanOptions::default());
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].anchors, vec!["ch1".to_string()]);
         assert_eq!(out[0].doc, Some(2));

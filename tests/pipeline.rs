@@ -117,9 +117,9 @@ fn assert_sample_book(book: &Book, name: &str) {
             "{name}: title segment"
         );
         assert!(
-            c.segments
-                .iter()
-                .all(|s| s.words <= 300 && !s.text.is_empty())
+            c.segments.iter().all(|s| s.chars <= 4000
+                && s.chars == s.text.chars().count()
+                && !s.text.is_empty())
         );
         // Segments also speak the numbers of ordered list items.
         let numbers = c
@@ -184,14 +184,14 @@ fn pdf_sample_from_font_sizes() {
 }
 
 #[test]
-fn smaller_segments_respect_limit() {
+fn smaller_segments_respect_char_limit() {
     let opts = ExtractOptions {
-        max_segment_words: 40,
+        max_segment_chars: 300,
         ..Default::default()
     };
     let book = extract("sample.epub", &opts);
     for c in &book.chapters {
-        assert!(c.segments.iter().all(|s| s.words <= 40));
+        assert!(c.segments.iter().all(|s| s.chars <= 300));
         assert!(c.segments.len() > 5);
     }
 }
@@ -219,4 +219,45 @@ fn writes_output_files() {
         let doc = roxmltree::Document::parse(&ssml).expect("SSML must be well-formed XML");
         assert_eq!(doc.root_element().tag_name().name(), "speak");
     }
+}
+
+#[test]
+fn sanitises_codes_before_segmenting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("tech.md");
+    std::fs::write(
+        &md,
+        "# Setup\n\nVerify the download against 3f786850e387550fdab836ed7e6dc881de23001b. \
+         Then export TOKEN=a8Fk29xLq0Zm7Q and run the installer.\n\n\
+         # Usage\n\nStart the service on 192.168.100.200 and wait.\n",
+    )
+    .unwrap();
+    let book = extract_book(&md, &ExtractOptions::default()).unwrap();
+    let spoken: String = book
+        .chapters
+        .iter()
+        .flat_map(|c| &c.segments)
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(spoken.contains("against long non-textual string ending in 2 3 0 0 1 b."));
+    assert!(spoken.contains("long non-textual string ending in q 0 Z m 7 Q and run"));
+    assert!(spoken.contains("192.168.100.200"));
+    assert!(!spoken.contains("3f786850"));
+
+    let raw = extract_book(
+        &md,
+        &ExtractOptions {
+            sanitize: false,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let raw_text: String = raw
+        .chapters
+        .iter()
+        .flat_map(|c| &c.segments)
+        .map(|s| s.text.as_str())
+        .collect();
+    assert!(raw_text.contains("3f786850e387550fdab836ed7e6dc881de23001b"));
 }

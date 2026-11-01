@@ -114,8 +114,18 @@ pub struct Cover {
 pub struct Segment {
     pub text: String,
     pub words: usize,
+    /// Unicode characters in `text` (the TTS request limit is in characters).
+    #[serde(default)]
+    pub chars: usize,
     /// Silence the audio stage should insert after this segment.
     pub pause_after_ms: u32,
+    /// Synthesised audio, relative to the book output dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_file: Option<String>,
+    /// Used instead of `audio_file` when moderation forced the segment to be
+    /// synthesised in pieces; played back to back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audio_parts: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -159,8 +169,29 @@ pub struct Book {
     pub source_file: String,
     pub metadata: BookMetadata,
     pub chapters: Vec<Chapter>,
+    /// Voice settings used for the audio, once synthesised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tts: Option<TtsInfo>,
+    /// Spoken opening credits and closing AI disclaimer (made by `synthesize`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<Credits>,
     #[serde(skip)]
     pub cover: Option<Cover>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Credits {
+    pub opening: Vec<Segment>,
+    pub closing: Vec<Segment>,
+}
+
+/// Which TTS model and voice produced the audio (needed for the AI disclaimer).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TtsInfo {
+    pub provider: String,
+    pub model: String,
+    pub voice: Option<String>,
+    pub format: String,
 }
 
 /// Output of a format-specific extractor, before cleaning and chapter splitting.
