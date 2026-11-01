@@ -11,7 +11,6 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
-use euclid::{point2, vec2};
 use pdf_extract::{ColorSpace, MediaBox, OutputDev, OutputError, Path, PathOp, Transform};
 use regex::Regex;
 
@@ -84,7 +83,7 @@ impl Collector {
         }
         let pts: Vec<_> = pts
             .into_iter()
-            .map(|(x, y)| m.transform_point(point2(x, y)))
+            .map(|(x, y)| m.transform_point((x, y).into()))
             .collect();
         if pts.is_empty() || self.width <= 0.0 {
             return;
@@ -138,7 +137,7 @@ impl OutputDev for Collector {
         char: &str,
     ) -> Result<(), OutputError> {
         let pos = trm.post_transform(&self.flip);
-        let v = trm.transform_vector(vec2(font_size, font_size));
+        let v = trm.transform_vector((font_size, font_size).into());
         let size = (v.x * v.y).abs().sqrt();
         if !size.is_finite() || size <= 0.0 {
             return Ok(());
@@ -280,7 +279,7 @@ fn render_line(glyphs: Vec<Glyph>) -> Option<Line> {
 }
 
 pub fn extract(path: &std::path::Path) -> Result<RawDocument> {
-    let mut doc = lopdf::Document::load(path).context("cannot parse PDF")?;
+    let mut doc = pdf_extract::Document::load(path).context("cannot parse PDF")?;
     if doc.is_encrypted() {
         // Many "encrypted" PDFs only restrict printing and open with an empty password.
         doc.decrypt("").context("PDF is password protected")?;
@@ -652,7 +651,7 @@ impl Assembler {
 
 // ---------------------------------------------------------------- metadata
 
-fn read_info(doc: &lopdf::Document) -> BookMetadata {
+fn read_info(doc: &pdf_extract::Document) -> BookMetadata {
     let mut meta = BookMetadata::default();
     let info = doc
         .trailer
@@ -664,7 +663,9 @@ fn read_info(doc: &lopdf::Document) -> BookMetadata {
         let get = |key: &[u8]| -> Option<String> {
             let obj = info.get(key).ok()?;
             let (_, obj) = doc.dereference(obj).ok()?;
-            lopdf::decode_text_string(obj).ok().and_then(non_empty)
+            pdf_extract::decode_text_string(obj)
+                .ok()
+                .and_then(non_empty)
         };
         meta.title = get(b"Title");
         meta.authors = get(b"Author")
@@ -679,12 +680,12 @@ fn read_info(doc: &lopdf::Document) -> BookMetadata {
         .catalog()
         .ok()
         .and_then(|c| c.get(b"Lang").ok())
-        .and_then(|o| lopdf::decode_text_string(o).ok())
+        .and_then(|o| pdf_extract::decode_text_string(o).ok())
         .and_then(non_empty);
     meta
 }
 
-fn read_outline(doc: &lopdf::Document) -> Vec<TocEntry> {
+fn read_outline(doc: &pdf_extract::Document) -> Vec<TocEntry> {
     let toc = match catch_unwind(AssertUnwindSafe(|| doc.get_toc())) {
         Ok(Ok(toc)) => toc.toc,
         _ => return Vec::new(),
