@@ -44,7 +44,18 @@ const SKIP_TITLES: &[&str] = &[
     "fotnoter",
     "list of figures",
     "list of tables",
+    "glossary",
+    "bibliography",
+    "references",
+    "works cited",
+    "copyright",
+    "title page",
+    "eula",
 ];
+
+/// A heading that starts a numbered chapter, e.g. "Chapter 3: Stride".
+static CHAPTER_HEADING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(chapter|kapittel|kapitel)\s+[\p{L}\d]+").unwrap());
 
 /// Minimum words for text before the first chapter to become "Front Matter".
 const FRONT_MATTER_MIN_WORDS: usize = 50;
@@ -102,6 +113,9 @@ pub fn split_chapters(
     }
 
     let mut points = toc_points(&blocks, toc);
+    if points.len() >= 2 {
+        points = chapters_inside_parts(&blocks, points);
+    }
     if points.len() < 2 {
         points = heading_points(&blocks);
     }
@@ -149,6 +163,36 @@ fn toc_points(blocks: &[Block], toc: &[TocEntry]) -> Vec<SplitPoint> {
         .collect();
     points.sort_by_key(|p| p.idx); // stable: keeps TOC order for shared targets
     select_levels(blocks, points)
+}
+
+/// Some outlines (e.g. Wiley PDFs) list only Parts, so a whole Part would
+/// become one many-hour chapter. Split such Parts at the "Chapter N"
+/// headings inside them.
+fn chapters_inside_parts(blocks: &[Block], points: Vec<SplitPoint>) -> Vec<SplitPoint> {
+    let mut out = Vec::with_capacity(points.len());
+    for (i, p) in points.iter().enumerate() {
+        out.push(p.clone());
+        if !PART_RE.is_match(&p.title) {
+            continue;
+        }
+        let end = points.get(i + 1).map_or(blocks.len(), |q| q.idx);
+        let has_children = points
+            .get(i + 1)
+            .is_some_and(|q| q.level > p.level && q.idx < end);
+        if has_children {
+            continue;
+        }
+        for (idx, b) in blocks.iter().enumerate().take(end).skip(p.idx + 1) {
+            if b.is_heading() && CHAPTER_HEADING.is_match(b.text.trim()) {
+                out.push(SplitPoint {
+                    idx,
+                    level: p.level + 1,
+                    title: b.text.trim().to_string(),
+                });
+            }
+        }
+    }
+    out
 }
 
 fn locate_toc_entry(blocks: &[Block], entry: &TocEntry) -> Option<usize> {
@@ -529,6 +573,50 @@ mod tests {
             vec!["Chapter 1: Fog", "Chapter 2: Light"]
         );
         assert_eq!(chapters[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn splits_outline_parts_at_chapter_headings() {
+        let mut blocks = vec![
+            Block::heading(1, "Introduction"),
+            para(60),
+            Block::heading(1, "Part I Getting Started"),
+            para(60),
+            Block::heading(1, "Chapter 1: Dive In"),
+            para(60),
+            Block::heading(2, "A Section"),
+            para(60),
+            Block::heading(1, "Chapter 2: Strategies"),
+            para(60),
+            Block::heading(1, "Glossary"),
+            para(60),
+        ];
+        for (b, page) in blocks.iter_mut().zip([1, 1, 3, 3, 4, 4, 5, 5, 6, 6, 9, 9]) {
+            b.page = Some(page);
+        }
+        let toc: Vec<TocEntry> = [
+            ("Introduction", 1),
+            ("Part I Getting Started", 3),
+            ("Glossary", 9),
+        ]
+        .into_iter()
+        .map(|(t, p)| TocEntry {
+            title: t.into(),
+            level: 1,
+            target: TocTarget::Page(p),
+        })
+        .collect();
+        let chapters = split_chapters(blocks, &toc, &opts());
+        assert_eq!(
+            titles(&chapters),
+            vec![
+                "Introduction",
+                "Part I Getting Started",
+                "Chapter 1: Dive In",
+                "Chapter 2: Strategies"
+            ]
+        );
+        assert!(chapters[2].blocks.iter().any(|b| b.text == "A Section"));
     }
 
     #[test]

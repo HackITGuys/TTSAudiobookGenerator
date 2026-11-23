@@ -9,6 +9,7 @@ use std::fmt::Write;
 use crate::model::{BlockKind, Chapter};
 use crate::segment::{
     HEADING_PAUSE_MS, LIST_ITEM_PAUSE_MS, SCENE_BREAK_PAUSE_MS, TITLE_PAUSE_MS, list_item_text,
+    spoken_text,
 };
 use crate::sentences::split_sentences;
 
@@ -61,6 +62,13 @@ pub fn chapter_to_ssml(chapter: &Chapter, language: Option<&str>) -> String {
             }
             BlockKind::Paragraph => {
                 let _ = writeln!(out, "  <p>{}</p>", sentences_xml(&block.text));
+            }
+            BlockKind::Table | BlockKind::Figure => {
+                let _ = writeln!(
+                    out,
+                    "  <p>{}</p>",
+                    sentences_xml(&spoken_text(block.kind, &block.text))
+                );
             }
             BlockKind::ListItem { .. } => {
                 let _ = writeln!(

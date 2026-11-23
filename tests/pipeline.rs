@@ -240,8 +240,8 @@ fn sanitises_codes_before_segmenting() {
         .map(|s| s.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(spoken.contains("against long non-textual string ending in 2 3 0 0 1 b."));
-    assert!(spoken.contains("long non-textual string ending in q 0 Z m 7 Q and run"));
+    assert!(spoken.contains("against a SHA-1 hash."));
+    assert!(spoken.contains("TOKEN=a random code and run"));
     assert!(spoken.contains("192.168.100.200"));
     assert!(!spoken.contains("3f786850"));
 
@@ -260,4 +260,282 @@ fn sanitises_codes_before_segmenting() {
         .map(|s| s.text.as_str())
         .collect();
     assert!(raw_text.contains("3f786850e387550fdab836ed7e6dc881de23001b"));
+}
+
+// ------------------------------------------------------------ refine / build
+
+use std::sync::Mutex;
+
+use tts_audiobook_generator::llm::{ChatBackend, ChatError, ChatMessage};
+use tts_audiobook_generator::refine::{RefineOptions, Task, refine};
+use tts_audiobook_generator::synthesize::{load_book, save_book};
+use tts_audiobook_generator::{BuildOptions, build_book};
+
+const TECH_BOOK: &str = "---\ntitle: Tech Notes\nauthor: A. Writer\n---\n\n\
+# Chapter 1: Setup\n\n\
+Install the tool and check the download. The steps below are the same on every system, \
+and the next section explains each of them in turn.\n\n\
+<!-- table: Table 1-1: Supported Systems -->\n| System | Notes |\n| Linux | Best |\n\n\
+<!-- figure: Figure 1-1: The setup screen -->\n\n\
+## Checking\n\n\
+Compare the result with the published value before you run anything.\n\n\
+# Chapter 2: Usage\n\n\
+Start the service and wait until it reports that it is ready to accept requests.\n";
+
+/// Answers like a well-behaved model: tables and figures become prose, the
+/// rest is returned unchanged.
+struct FakeModel {
+    calls: Mutex<usize>,
+    /// Answer with commentary to trigger the validation fallback.
+    chatty: bool,
+}
+
+impl ChatBackend for FakeModel {
+    fn chat(&self, _model: &str, messages: &[ChatMessage]) -> Result<String, ChatError> {
+        *self.calls.lock().unwrap() += 1;
+        let user = &messages[1].content;
+        let input = user
+            .rsplit("TEXT TO REPAIR:\n<<<\n")
+            .next()
+            .unwrap()
+            .trim_end_matches(">>>")
+            .trim();
+        let mut out = Vec::new();
+        for block in input.split("\n\n") {
+            if let Some(rest) = block.strip_prefix("<!-- table: ") {
+                let caption = rest.lines().next().unwrap().trim_end_matches(" -->");
+                out.push(format!(
+                    "{caption}, lists one system, Linux, which works best."
+                ));
+            } else if let Some(rest) = block.strip_prefix("<!-- figure: ") {
+                out.push(format!(
+                    "{} shows the first screen.",
+                    rest.trim_end_matches(" -->")
+                ));
+            } else {
+                out.push(block.to_string());
+            }
+        }
+        let answer = out.join("\n\n");
+        Ok(if self.chatty {
+            format!("Here is the repaired text:\n\n{answer}")
+        } else {
+            answer
+        })
+    }
+}
+
+fn refine_opts() -> RefineOptions {
+    RefineOptions {
+        task: Task::Repair,
+        model: "fake".into(),
+        concurrency: 2,
+        force: false,
+        chapters: None,
+        chunk_chars: 6000,
+    }
+}
+
+fn extracted_tech_book(tmp: &std::path::Path) -> PathBuf {
+    let md = tmp.join("tech.md");
+    std::fs::write(&md, TECH_BOOK).unwrap();
+    let mut book = extract_book(&md, &ExtractOptions::default()).unwrap();
+    write_book(&mut book, &tmp.join("out"), true).unwrap()
+}
+
+#[test]
+fn build_from_raw_markdown_reproduces_extract() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["sample.docx", "sample.epub", "sample.pdf"] {
+        let mut book = extract(name, &ExtractOptions::default());
+        let dir = write_book(&mut book, &tmp.path().join(name), true).unwrap();
+        assert!(dir.join("raw").is_dir());
+        let rebuilt = build_book(&dir, &BuildOptions::default()).unwrap();
+        assert_eq!(rebuilt.text_stage.as_deref(), Some("raw"));
+        let texts = |b: &Book| -> Vec<Vec<String>> {
+            b.chapters
+                .iter()
+                .map(|c| c.segments.iter().map(|s| s.text.clone()).collect())
+                .collect()
+        };
+        assert_eq!(texts(&rebuilt), texts(&book), "{name}: raw/ round trip");
+    }
+}
+
+#[test]
+fn refine_writes_text_caches_answers_and_keeps_hand_edits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = extracted_tech_book(tmp.path());
+
+    // Without refine, tables are only referenced and figures read as captions.
+    let raw = build_book(&dir, &BuildOptions::default()).unwrap();
+    let raw_text: String = raw.chapters[0]
+        .segments
+        .iter()
+        .map(|s| s.text.clone())
+        .collect();
+    assert!(raw_text.contains("Table 1-1, Supported Systems, is shown in the book."));
+    assert!(raw_text.contains("Figure 1-1: The setup screen."));
+
+    let model = FakeModel {
+        calls: Mutex::new(0),
+        chatty: false,
+    };
+    let (mut book, dir) = load_book(&dir).unwrap();
+    let report = refine(&mut book, &dir, &model, &refine_opts(), &|_| {}).unwrap();
+    save_book(&book, &dir).unwrap();
+    assert_eq!(report.chapters_written, 2);
+    assert_eq!(report.sent, 2);
+    assert!(report.fallbacks.is_empty() && report.failed.is_empty());
+
+    let built = build_book(&dir, &BuildOptions::default()).unwrap();
+    assert_eq!(built.text_stage.as_deref(), Some("refined"));
+    let spoken: String = built.chapters[0]
+        .segments
+        .iter()
+        .map(|s| s.text.clone())
+        .collect();
+    assert!(spoken.contains("Table 1-1: Supported Systems, lists one system, Linux"));
+    assert!(spoken.contains("Figure 1-1: The setup screen shows the first screen."));
+    assert!(!spoken.contains("<!--"));
+    // The heading travels with its paragraph; the title stays alone.
+    assert_eq!(built.chapters[0].segments[0].text, "Chapter 1: Setup.");
+
+    // Hand edits survive a re-run, and are what `build` speaks.
+    let text_file = dir.join(built.chapters[1].refined_file.as_ref().unwrap());
+    std::fs::write(&text_file, "# Chapter 2: Usage\n\nEdited by hand.\n").unwrap();
+    let (mut book, _) = load_book(&dir).unwrap();
+    let report = refine(&mut book, &dir, &model, &refine_opts(), &|_| {}).unwrap();
+    assert_eq!(report.chapters_kept, 2);
+    assert_eq!(*model.calls.lock().unwrap(), 2);
+    let built = build_book(&dir, &BuildOptions::default()).unwrap();
+    assert_eq!(built.chapters[1].segments[1].text, "Edited by hand.");
+
+    // --force re-refines from the cache without calling the model.
+    let (mut book, _) = load_book(&dir).unwrap();
+    let opts = RefineOptions {
+        force: true,
+        ..refine_opts()
+    };
+    let report = refine(&mut book, &dir, &model, &opts, &|_| {}).unwrap();
+    assert_eq!((report.cached, report.sent), (2, 0));
+    assert_eq!(*model.calls.lock().unwrap(), 2);
+    assert!(
+        !std::fs::read_to_string(&text_file)
+            .unwrap()
+            .contains("Edited by hand")
+    );
+}
+
+#[test]
+fn rejected_answers_fall_back_to_extracted_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = extracted_tech_book(tmp.path());
+    let model = FakeModel {
+        calls: Mutex::new(0),
+        chatty: true,
+    };
+    let (mut book, dir) = load_book(&dir).unwrap();
+    let opts = RefineOptions {
+        chapters: Some(vec![1]),
+        ..refine_opts()
+    };
+    let report = refine(&mut book, &dir, &model, &opts, &|_| {}).unwrap();
+    // One retry with the reason, then the extracted text is kept.
+    assert_eq!(*model.calls.lock().unwrap(), 2);
+    assert_eq!(report.fallbacks.len(), 1);
+    assert!(report.fallbacks[0].2.contains("commentary"));
+    assert_eq!(report.chapters_written, 1);
+    save_book(&book, &dir).unwrap();
+    let built = build_book(&dir, &BuildOptions::default()).unwrap();
+    assert_eq!(built.text_stage.as_deref(), Some("partial"));
+}
+
+/// Abridges like a well-behaved model: keeps the title, the first paragraph
+/// of each section and drops the rest.
+struct FakeAbridger;
+
+impl ChatBackend for FakeAbridger {
+    fn chat(&self, _model: &str, messages: &[ChatMessage]) -> Result<String, ChatError> {
+        assert!(messages[0].content.contains("about 40% of"));
+        let input = messages[1]
+            .content
+            .rsplit("TEXT TO ABRIDGE:\n<<<\n")
+            .next()
+            .unwrap()
+            .trim_end_matches(">>>")
+            .trim();
+        let mut out = Vec::new();
+        let mut kept_para = false;
+        for block in input.split("\n\n") {
+            if block.starts_with('#') {
+                out.push(block.to_string());
+                kept_para = false;
+            } else if !kept_para {
+                out.push(block.to_string());
+                kept_para = true;
+            }
+        }
+        Ok(out.join("\n\n"))
+    }
+}
+
+#[test]
+fn abridge_makes_a_separate_shorter_book() {
+    use tts_audiobook_generator::abridge;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let long_chapter = (1..=6)
+        .map(|i| {
+            format!(
+                "Paragraph {i} of the chapter. {}",
+                "Some words here. ".repeat(20)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let md = tmp.path().join("long.md");
+    std::fs::write(
+        &md,
+        format!(
+            "---\ntitle: Long Notes\n---\n\n# Chapter 1: One\n\n{long_chapter}\n\n# Chapter 2: Two\n\n{long_chapter}\n\n# Appendix A: Extra\n\n{long_chapter}\n"
+        ),
+    )
+    .unwrap();
+    let mut book = extract_book(&md, &ExtractOptions::default()).unwrap();
+    let src = write_book(&mut book, &tmp.path().join("out"), true).unwrap();
+
+    let dst = abridge::default_dir(&src);
+    assert!(dst.ends_with("long-notes-abridged"));
+    let prepared = abridge::prepare(&src, &dst, &[3]).unwrap();
+    assert_eq!(
+        prepared.metadata.title.as_deref(),
+        Some("Long Notes (Abridged)")
+    );
+    assert_eq!(prepared.chapters.len(), 2);
+
+    let (mut abridged, dst) = load_book(&dst).unwrap();
+    let opts = RefineOptions {
+        task: Task::Abridge { percent: 40 },
+        ..refine_opts()
+    };
+    let report = refine(&mut abridged, &dst, &FakeAbridger, &opts, &|_| {}).unwrap();
+    assert_eq!(report.chapters_written, 2);
+    assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
+    save_book(&abridged, &dst).unwrap();
+    let built = build_book(&dst, &BuildOptions::default()).unwrap();
+    assert_eq!(built.text_stage.as_deref(), Some("refined"));
+
+    let words = |b: &Book| b.chapters.iter().map(|c| c.word_count).sum::<usize>();
+    let full = load_book(&src).unwrap().0;
+    assert!(
+        words(&built) * 2 < words(&full),
+        "abridged book must be much shorter"
+    );
+    assert_eq!(built.chapters[0].segments[0].text, "Chapter 1: One.");
+    // The full book is untouched.
+    assert_eq!(full.text_stage.as_deref(), Some("raw"));
+    assert!(!src.join("text").exists());
+    // An abridged book cannot be abridged again.
+    assert!(abridge::prepare(&dst, &tmp.path().join("again"), &[]).is_err());
 }

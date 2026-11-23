@@ -7,6 +7,10 @@
 //! Pauses are carried as `pause_after_ms` and inserted as silence by the
 //! audio stage.
 
+use std::sync::LazyLock;
+
+use regex::Regex;
+
 use crate::model::{BlockKind, Chapter, Segment, word_count};
 use crate::sentences::split_sentences;
 
@@ -19,9 +23,14 @@ pub const MID_PARAGRAPH_PAUSE_MS: u32 = 250;
 
 /// Voxtral TTS request limit.
 pub const DEFAULT_MAX_SEGMENT_CHARS: usize = 4000;
+/// Segments shorter than this are merged into a neighbour when they fit.
+pub const DEFAULT_MIN_SEGMENT_CHARS: usize = 600;
 
 /// Separator between paragraphs packed into one segment.
 const PARA_SEP: &str = "\n";
+
+static TABLE_CAPTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(Table\s+[\w.-]+)\s*[:.]?\s*(.*)$").unwrap());
 
 /// Text of a list item as it should be spoken.
 pub fn list_item_text(kind: BlockKind, text: &str) -> String {
@@ -31,6 +40,39 @@ pub fn list_item_text(kind: BlockKind, text: &str) -> String {
             index,
         } => format!("{index}. {text}"),
         _ => text.to_string(),
+    }
+}
+
+/// End a heading or caption with a full stop so the voice pauses after it.
+pub fn with_full_stop(text: &str) -> String {
+    let t = text.trim().trim_end_matches([':', ';', ',']);
+    if t.ends_with(['.', '!', '?', '…']) {
+        t.to_string()
+    } else {
+        format!("{t}.")
+    }
+}
+
+/// How a block is spoken when the text has not been refined by the LLM:
+/// tables are only referenced ("Table 1-2, Addressing Tampering, is shown
+/// in the book."), figures read their caption.
+pub fn spoken_text(kind: BlockKind, text: &str) -> String {
+    match kind {
+        BlockKind::ListItem { .. } => list_item_text(kind, text),
+        BlockKind::Heading { .. } | BlockKind::Figure => with_full_stop(text),
+        BlockKind::Table => {
+            let caption = text.lines().next().unwrap_or("").trim();
+            match TABLE_CAPTION.captures(caption) {
+                Some(c) if !c[2].trim().is_empty() => format!(
+                    "{}, {}, is shown in the book.",
+                    &c[1],
+                    c[2].trim().trim_end_matches('.')
+                ),
+                Some(c) => format!("{} is shown in the book.", &c[1]),
+                None => "A table is shown in the book.".into(),
+            }
+        }
+        BlockKind::Paragraph | BlockKind::SceneBreak => text.to_string(),
     }
 }
 
@@ -56,9 +98,37 @@ struct Packer {
     /// Characters of `parts` joined with `PARA_SEP`.
     chars: usize,
     pause: u32,
+    /// Heading(s) waiting to be spoken together with the next block, so a
+    /// heading never ends up as a tiny segment of its own.
+    heading: Option<String>,
 }
 
 impl Packer {
+    fn heading(&mut self, text: String) {
+        self.heading = Some(match self.heading.take() {
+            Some(prev) => format!("{prev}{PARA_SEP}{text}"),
+            None => text,
+        });
+    }
+
+    /// Speak a pending heading on its own (nothing follows it to attach to).
+    fn release_heading(&mut self) {
+        if let Some(h) = self.heading.take() {
+            self.push_unit(h, HEADING_PAUSE_MS);
+        }
+    }
+
+    /// Push a block, prefixed with the pending heading when both fit.
+    fn push_block(&mut self, text: String, pause: u32) {
+        if let Some(h) = self.heading.take() {
+            if char_len(&h) + PARA_SEP.len() + char_len(&text) <= self.max_chars {
+                return self.push_unit(format!("{h}{PARA_SEP}{text}"), pause);
+            }
+            self.push_unit(h, HEADING_PAUSE_MS);
+        }
+        self.push_unit(text, pause);
+    }
+
     fn flush(&mut self) {
         if self.parts.is_empty() {
             return;
@@ -104,12 +174,13 @@ impl Packer {
         } else {
             self.add(text, pause);
         }
-        if pause >= HEADING_PAUSE_MS {
+        if pause >= TITLE_PAUSE_MS {
             self.flush();
         }
     }
 
     fn scene_break(&mut self) {
+        self.release_heading();
         if !self.parts.is_empty() {
             self.pause = self.pause.max(SCENE_BREAK_PAUSE_MS);
             self.flush();
@@ -187,15 +258,24 @@ fn split_sentence(sentence: &str, max: usize) -> Vec<String> {
     pieces
 }
 
+/// Build the TTS segments for a chapter with the default minimum size.
+pub fn segment_chapter(chapter: &Chapter, max_chars: usize) -> Vec<Segment> {
+    segment_chapter_with(chapter, max_chars, DEFAULT_MIN_SEGMENT_CHARS)
+}
+
 /// Build the TTS segments for a chapter. The chapter title is always a
 /// segment of its own so chapter markers line up with the spoken title.
-pub fn segment_chapter(chapter: &Chapter, max_chars: usize) -> Vec<Segment> {
+/// Headings are spoken together with the block that follows them, and
+/// segments shorter than `min_chars` are merged into a neighbour.
+pub fn segment_chapter_with(chapter: &Chapter, max_chars: usize, min_chars: usize) -> Vec<Segment> {
+    let max_chars = max_chars.max(1);
     let mut p = Packer {
-        max_chars: max_chars.max(1),
+        max_chars,
         segments: Vec::new(),
         parts: Vec::new(),
         chars: 0,
         pause: PARAGRAPH_PAUSE_MS,
+        heading: None,
     };
     p.push_unit(
         format!("{}.", chapter.title.trim_end_matches(['.', ':'])),
@@ -203,20 +283,43 @@ pub fn segment_chapter(chapter: &Chapter, max_chars: usize) -> Vec<Segment> {
     );
 
     for block in &chapter.blocks {
+        let text = spoken_text(block.kind, &block.text);
         match block.kind {
-            BlockKind::Heading { .. } => {
-                p.flush();
-                p.push_unit(block.text.clone(), HEADING_PAUSE_MS);
-            }
-            BlockKind::Paragraph => p.push_unit(block.text.clone(), PARAGRAPH_PAUSE_MS),
-            BlockKind::ListItem { .. } => {
-                p.push_unit(list_item_text(block.kind, &block.text), LIST_ITEM_PAUSE_MS)
+            BlockKind::Heading { .. } => p.heading(text),
+            BlockKind::ListItem { .. } => p.push_block(text, LIST_ITEM_PAUSE_MS),
+            BlockKind::Paragraph | BlockKind::Table | BlockKind::Figure => {
+                p.push_block(text, PARAGRAPH_PAUSE_MS)
             }
             BlockKind::SceneBreak => p.scene_break(),
         }
     }
+    p.release_heading();
     p.flush();
-    p.segments
+    merge_small(p.segments, min_chars, max_chars)
+}
+
+/// Merge segments shorter than `min_chars` into the following one when the
+/// result still fits `max_chars`. The title segment (first) is never merged.
+/// A scene break (long pause) is only merged across when the text on both
+/// sides is short: rules between table rows or list entries, not a real
+/// break between two passages.
+pub fn merge_small(segments: Vec<Segment>, min_chars: usize, max_chars: usize) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::with_capacity(segments.len());
+    for seg in segments {
+        if out.len() > 1
+            && let Some(last) = out.last_mut()
+            && (last.chars < min_chars || seg.chars < min_chars)
+            && last.chars + PARA_SEP.len() + seg.chars <= max_chars
+            && (last.pause_after_ms < SCENE_BREAK_PAUSE_MS
+                || (last.chars < min_chars && seg.chars < min_chars))
+        {
+            let text = format!("{}{PARA_SEP}{}", last.text, seg.text);
+            *last = segment(text, seg.pause_after_ms);
+            continue;
+        }
+        out.push(seg);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -293,15 +396,19 @@ mod tests {
     }
 
     #[test]
-    fn scene_breaks_and_headings_end_segments() {
+    fn scene_breaks_end_segments_and_headings_join_their_text() {
         let blocks = vec![
             Block::paragraph("Before."),
             Block::scene_break(),
             Block::paragraph("After."),
             Block::heading(3, "A Section"),
+            Block::heading(4, "A Subsection:"),
             Block::paragraph("Inside."),
+            Block::scene_break(),
+            Block::heading(3, "Last Words"),
         ];
-        let segs = segment_chapter(&chapter(blocks), 4000);
+        // Merging disabled: this checks how blocks are packed.
+        let segs = segment_chapter_with(&chapter(blocks), 4000, 0);
         let summary: Vec<(&str, u32)> = segs
             .iter()
             .map(|s| (s.text.as_str(), s.pause_after_ms))
@@ -311,10 +418,85 @@ mod tests {
             vec![
                 ("Chapter 1: The Lighthouse.", TITLE_PAUSE_MS),
                 ("Before.", SCENE_BREAK_PAUSE_MS),
-                ("After.", PARAGRAPH_PAUSE_MS),
-                ("A Section", HEADING_PAUSE_MS),
-                ("Inside.", PARAGRAPH_PAUSE_MS),
+                (
+                    "After.\nA Section.\nA Subsection.\nInside.",
+                    SCENE_BREAK_PAUSE_MS
+                ),
+                ("Last Words.", HEADING_PAUSE_MS),
             ]
+        );
+    }
+
+    #[test]
+    fn heading_is_not_left_alone_without_room() {
+        // The heading and its paragraph do not fit together: both are kept,
+        // but the heading still goes with the preceding text, not alone.
+        let para = "x".repeat(60);
+        let blocks = vec![
+            Block::paragraph("Intro."),
+            Block::heading(2, "Next"),
+            Block::paragraph(para.clone()),
+        ];
+        let segs = segment_chapter_with(&chapter(blocks), 64, 0);
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Chapter 1: The Lighthouse.", "Intro.\nNext.", &para]
+        );
+    }
+
+    #[test]
+    fn merges_small_segments_but_not_the_title_or_scene_breaks() {
+        let s = |t: &str, pause| segment(t.into(), pause);
+        let long = "y".repeat(60);
+        let merged = merge_small(
+            vec![
+                s("Title.", TITLE_PAUSE_MS),
+                s("Short one.", PARAGRAPH_PAUSE_MS),
+                s("Short two.", SCENE_BREAK_PAUSE_MS),
+                s(&long, SCENE_BREAK_PAUSE_MS),
+                s("Row a.", SCENE_BREAK_PAUSE_MS),
+                s("Row b.", SCENE_BREAK_PAUSE_MS),
+                s("Row c.", PARAGRAPH_PAUSE_MS),
+            ],
+            50,
+            100,
+        );
+        let summary: Vec<(&str, u32)> = merged
+            .iter()
+            .map(|s| (s.text.as_str(), s.pause_after_ms))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Title.", TITLE_PAUSE_MS),
+                ("Short one.\nShort two.", SCENE_BREAK_PAUSE_MS),
+                // A long passage keeps its scene breaks on both sides.
+                (long.as_str(), SCENE_BREAK_PAUSE_MS),
+                // Short pieces between rules are joined.
+                ("Row a.\nRow b.\nRow c.", PARAGRAPH_PAUSE_MS),
+            ]
+        );
+        assert_eq!(merged[1].chars, 21);
+        assert_eq!(merged[1].words, 4);
+    }
+
+    #[test]
+    fn tables_and_figures_have_spoken_fallbacks() {
+        assert_eq!(
+            spoken_text(
+                BlockKind::Table,
+                "Table 1-2: Addressing Tampering Threats\nA | B\nc | d"
+            ),
+            "Table 1-2, Addressing Tampering Threats, is shown in the book."
+        );
+        assert_eq!(
+            spoken_text(BlockKind::Table, "THREAT | TARGET"),
+            "A table is shown in the book."
+        );
+        assert_eq!(
+            spoken_text(BlockKind::Figure, "Figure 1-1: A whiteboard diagram"),
+            "Figure 1-1: A whiteboard diagram."
         );
     }
 }

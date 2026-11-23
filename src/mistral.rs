@@ -22,6 +22,27 @@ pub const BASE_URL_ENV: &str = "MISTRAL_API_BASE";
 /// Base64 audio for a few minutes of WAV can exceed ureq's 10 MB default.
 const MAX_RESPONSE_BYTES: u64 = 200 * 1024 * 1024;
 
+/// Delay before retry `attempt` (0-based): the server's `Retry-After` if it
+/// sent one, else `base` doubled per attempt; capped at 60 s.
+pub(crate) fn backoff_delay(
+    base: Duration,
+    attempt: u32,
+    retry_after: Option<Duration>,
+) -> Duration {
+    let exp = base.saturating_mul(1 << attempt.min(10));
+    retry_after.unwrap_or(exp).min(Duration::from_secs(60))
+}
+
+/// `Retry-After` in seconds, if the response carries one.
+pub(crate) fn retry_after(headers: &ureq::http::HeaderMap) -> Option<Duration> {
+    headers
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(Duration::from_secs_f64)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SpeechRequest<'a> {
     pub model: &'a str,
@@ -123,8 +144,7 @@ impl MistralClient {
     }
 
     fn backoff(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
-        let exp = self.retry_base.saturating_mul(1 << attempt.min(10));
-        retry_after.unwrap_or(exp).min(Duration::from_secs(60))
+        backoff_delay(self.retry_base, attempt, retry_after)
     }
 
     /// List all voices available to this account.
@@ -196,12 +216,7 @@ impl SpeechBackend for MistralClient {
                     .map_err(|e| SpeechError::Failed(format!("invalid base64 audio: {e}")));
             }
 
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .map(Duration::from_secs_f64);
+            let retry_after = retry_after(resp.headers());
             let body = resp.body_mut().read_to_string().unwrap_or_default();
             let message = format!("HTTP {status}: {}", body.trim());
 
@@ -258,14 +273,16 @@ fn guardrail_categories(body: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
     /// Serve canned HTTP responses, one per connection, and record request bodies.
-    fn mock_server(responses: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    pub(crate) fn mock_server(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = format!("http://{}", listener.local_addr().unwrap());
         let seen = Arc::new(Mutex::new(Vec::new()));

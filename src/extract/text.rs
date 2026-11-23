@@ -20,6 +20,26 @@ static SCENE_BREAK: LazyLock<Regex> = LazyLock::new(|| {
 static FOOTNOTE_DEF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\[\^[^\]]+\]:").unwrap());
 static FOOTNOTE_REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[\^[^\]]+\]").unwrap());
 static LINK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"!?\[([^\]]*)\]\([^)]*\)").unwrap());
+/// `<!-- table: Table 1-1: Caption -->` / `<!-- figure: ... -->` markers
+/// written by `output::chapter_to_markdown`.
+static MARKER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^<!--\s*(table|figure)\s*:?\s*(.*?)\s*-->$").unwrap());
+static COMMENT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^<!--.*-->$").unwrap());
+static TABLE_RULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\|?[\s:|-]+\|?$").unwrap());
+
+/// `| a | b |` -> `a | b`; `None` for a `|---|---|` separator row.
+fn table_row(line: &str) -> Option<String> {
+    if TABLE_RULE.is_match(line) {
+        return None;
+    }
+    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
+    let cells: Vec<String> = inner
+        .split('|')
+        .map(|c| inline(c.trim()))
+        .filter(|c| !c.is_empty())
+        .collect();
+    (!cells.is_empty()).then(|| cells.join(" | "))
+}
 
 pub fn extract(path: &Path) -> Result<RawDocument> {
     let raw = std::fs::read(path)?;
@@ -40,6 +60,7 @@ pub fn parse(text: &str) -> RawDocument {
     let mut blocks = Vec::new();
     let mut para: Vec<String> = Vec::new();
     let mut in_footnote = false;
+    let mut in_table = false;
 
     let flush = |para: &mut Vec<String>, blocks: &mut Vec<Block>| {
         if !para.is_empty() {
@@ -62,8 +83,45 @@ pub fn parse(text: &str) -> RawDocument {
             }
             in_footnote = false;
         }
+        // Rows of an open table: `| a | b |` lines right after the table
+        // marker (or the first row).
+        if para.is_empty()
+            && trimmed.starts_with('|')
+            && let Some(last) = blocks.last_mut()
+            && last.kind == BlockKind::Table
+            && in_table
+        {
+            if let Some(row) = table_row(trimmed) {
+                last.text.push('\n');
+                last.text.push_str(&row);
+            }
+            continue;
+        }
+        in_table = false;
+
         if trimmed.is_empty() {
             flush(&mut para, &mut blocks);
+        } else if let Some(escaped) = trimmed.strip_prefix('\\') {
+            // A paragraph line that only looks like Markdown structure.
+            para.push(escaped.to_string());
+        } else if let Some(c) = MARKER.captures(trimmed) {
+            flush(&mut para, &mut blocks);
+            if &c[1] == "table" {
+                blocks.push(Block::new(BlockKind::Table, c[2].to_string()));
+                in_table = true;
+            } else {
+                blocks.push(Block::new(BlockKind::Figure, c[2].to_string()));
+            }
+        } else if COMMENT.is_match(trimmed) {
+            continue;
+        } else if trimmed.starts_with('|') && para.is_empty() {
+            // A Markdown table without a caption marker.
+            let mut block = Block::new(BlockKind::Table, String::new());
+            if let Some(row) = table_row(trimmed) {
+                block.text = format!("\n{row}");
+            }
+            blocks.push(block);
+            in_table = true;
         } else if let Some(c) = HEADING.captures(trimmed) {
             flush(&mut para, &mut blocks);
             blocks.push(Block::heading(c[1].len() as u8, inline(&c[2])));

@@ -19,7 +19,7 @@ macro_rules! re {
 
 re!(
     INVISIBLE,
-    "[\u{00AD}\u{200B}\u{200C}\u{200D}\u{2060}\u{FEFF}]"
+    "[\u{00AD}\u{200B}\u{200C}\u{200D}\u{2060}\u{FEFF}\u{0000}-\u{0008}\u{000B}\u{000C}\u{000E}-\u{001F}\u{007F}]"
 );
 re!(
     ODD_SPACES,
@@ -33,7 +33,11 @@ re!(
     r"(?i)\s?\[(?:\d+(?:\s*[-–,]\s*\d+)*|citation needed|note \d+|fn ?\d+|\^[^\]]+)\]"
 );
 re!(TRAILING_MARKS, r"([\p{L}.,;:!?])[*†‡]+(\s|$)");
-re!(URL, r"(?i)\b(?:https?://|www\.)\S+");
+re!(
+    URL,
+    r"(?i)\b(?:(?:https?|s?ftps?)://|www\.)\S+|\b(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,6}/\S*"
+);
+re!(TRAILING_HYPHEN, r"\p{Ll}-$");
 re!(DOT_LEADER, r"(?:\.\s?){4,}\s*\d+\s*$");
 re!(MARKUP_CHARS, r"[*_`#|~^]");
 re!(LEADING_BULLET, r"^[•●▪■►▶◦‣⁃∙·–-]\s+");
@@ -139,7 +143,10 @@ fn url_to_domain(url: &str) -> String {
         url.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '"', '\'', '”', '’']);
     let tail = &url[trimmed.len()..];
     let without_scheme = trimmed.split_once("://").map_or(trimmed, |(_, rest)| rest);
-    let host = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = without_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop `user:pass@` and `:port`.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
     let host = host.strip_prefix("www.").unwrap_or(host);
     format!("{host}{tail}")
 }
@@ -152,8 +159,31 @@ pub fn clean_blocks(blocks: Vec<Block>, opts: CleanOptions) -> Vec<Block> {
     let mut pending: Option<Block> = None;
 
     for mut block in blocks {
-        if block.kind != BlockKind::SceneBreak {
-            block.text = clean_text_with(&block.text, opts);
+        match block.kind {
+            BlockKind::SceneBreak => {}
+            // Caption (first line, possibly empty) and rows are cleaned line
+            // by line, and rows cell by cell, so the structure survives.
+            BlockKind::Table => {
+                let mut lines = block.text.lines();
+                let caption = clean_text_with(lines.next().unwrap_or(""), opts);
+                let rows = lines
+                    .map(|l| {
+                        l.split(" | ")
+                            .map(|cell| clean_text_with(cell, opts))
+                            .filter(|c| !c.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                    .filter(|l| !l.is_empty());
+                block.text = std::iter::once(caption)
+                    .chain(rows)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if block.text.trim().is_empty() {
+                    block.text.clear();
+                }
+            }
+            _ => block.text = clean_text_with(&block.text, opts),
         }
         let empty = block.kind != BlockKind::SceneBreak && block.text.is_empty();
 
@@ -176,6 +206,20 @@ pub fn clean_blocks(blocks: Vec<Block>, opts: CleanOptions) -> Vec<Block> {
             // Only keep the location so the anchors can move forward, unless
             // the next block belongs to another document.
             pending = Some(block);
+            continue;
+        }
+
+        // A word hyphenated across two paragraphs (a page or column break
+        // the layout reader took for a paragraph break).
+        if block.kind == BlockKind::Paragraph
+            && block.text.starts_with(|c: char| c.is_lowercase())
+            && let Some(last) = out.last_mut()
+            && last.kind == BlockKind::Paragraph
+            && TRAILING_HYPHEN.is_match(&last.text)
+        {
+            last.text.pop();
+            last.text.push_str(&block.text);
+            last.anchors.append(&mut block.anchors);
             continue;
         }
 
@@ -233,6 +277,15 @@ mod tests {
             "Visit example.org, then"
         );
         assert_eq!(clean_text("see www.lighthouse.no."), "see lighthouse.no.");
+        assert_eq!(
+            clean_text("at https://user@docs.example.com:8443/a#b and ftp://ftp.example.net/pub."),
+            "at docs.example.com and ftp.example.net."
+        );
+        assert_eq!(
+            clean_text("download from tools.example.org/files/x.zip today"),
+            "download from tools.example.org today"
+        );
+        assert_eq!(clean_text("and/or e.g. 2.5"), "and/or e.g. 2.5");
     }
 
     #[test]
@@ -246,12 +299,42 @@ mod tests {
     fn sanitises_codes_before_markup_stripping() {
         assert_eq!(
             clean_text("Run `sha1sum` -> **3f786850e387550fdab836ed7e6dc881de23001b**."),
-            "Run sha1sum -> long non-textual string ending in 2 3 0 0 1 b."
+            "Run sha1sum -> a SHA-1 hash."
         );
         let off = CleanOptions { sanitize: false };
         assert_eq!(
             clean_text_with("hash 3f786850e387550fdab836ed7e6dc881de23001b", off),
             "hash 3f786850e387550fdab836ed7e6dc881de23001b"
+        );
+    }
+
+    #[test]
+    fn strips_control_characters() {
+        assert_eq!(clean_text("thr\u{0}eats\u{7}"), "threats");
+    }
+
+    #[test]
+    fn joins_words_hyphenated_across_blocks_and_cleans_tables() {
+        let table = Block::new(BlockKind::Table, "Table 1-1: Things\n* a | b\n\n");
+        let out = clean_blocks(
+            vec![
+                Block::paragraph("an acknowl-"),
+                Block::paragraph("edged fact."),
+                Block::paragraph("Self-"),
+                Block::paragraph("Contained"),
+                table,
+            ],
+            CleanOptions::default(),
+        );
+        let texts: Vec<&str> = out.iter().map(|b| b.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "an acknowledged fact.",
+                "Self-",
+                "Contained",
+                "Table 1-1: Things\na | b"
+            ]
         );
     }
 

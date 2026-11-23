@@ -21,12 +21,28 @@ use crate::model::{Block, BlockKind, BookMetadata, RawDocument, TocEntry, TocTar
 const HEADING_RATIO: f64 = 1.15;
 /// Lines this much smaller than the body text at the page bottom may be footnotes.
 const FOOTNOTE_RATIO: f64 = 0.92;
+/// A horizontal gap wider than this many ems separates table cells.
+const CELL_GAP: f64 = 1.0;
+/// Safety stop for a table region that never meets prose again.
+const MAX_TABLE_LINES: usize = 400;
 
 static PAGE_NUMBER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^[\s\-–—]*(?:page\s+|side\s+)?(?:\d{1,4}|[ivxlcdm]{1,7})(?:\s+(?:of|av)\s+\d+)?[\s\-–—]*$").unwrap()
 });
 static BULLET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[•●▪■◦‣⁃∙·–\-]\s*(.+)$").unwrap());
 static NUMBERED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d{1,3})[.)]\s+(.+)$").unwrap());
+static TABLE_CAPTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Table\s+[A-Z]?\d+[-.–]\d+\s*[:.]\s*\S").unwrap());
+static FIGURE_CAPTION: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^Figure\s+[A-Z]?\d+[-.–]\d+\s*[:.]\s*\S").unwrap());
+/// "C H A P T E R" and other letter-spaced display words.
+static LETTER_SPACED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(?:\p{L} ){3,}\p{L}\b").unwrap());
+/// "CHAPTER: 1: Title" / "Chapter 1 Title" -> "Chapter 1: Title".
+static NUMBERED_HEADING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?i:(chapter|part|appendix))\s*:?\s*(\d+\b|[IVXLCDM]+\b|[A-Z]\b)\s*:?\s*")
+        .unwrap()
+});
 
 #[derive(Debug, Clone)]
 struct Glyph {
@@ -47,6 +63,8 @@ struct Line {
     size: f64,
     /// The line starts with a digit or note symbol (before superscript removal).
     lead_mark: bool,
+    /// Runs of text separated by wide gaps (table columns), with their x.
+    cells: Vec<(f64, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -215,7 +233,36 @@ fn build_lines(glyphs: Vec<Glyph>) -> Vec<Line> {
     groups.into_iter().filter_map(render_line).collect()
 }
 
+fn is_ligature(text: &str) -> bool {
+    matches!(
+        text,
+        "fi" | "fl" | "ff" | "ffi" | "ffl" | "ft" | "st" | "ﬁ" | "ﬂ" | "ﬀ" | "ﬃ" | "ﬄ" | "ﬅ" | "ﬆ"
+    )
+}
+
+/// Some PDFs (e.g. Wiley's) emit a space glyph that overlaps a ligature
+/// glyph ("fi", "fl"); taken at face value it splits the word ("spoofi ng").
+/// A real word space starts after the previous glyph and ends before the
+/// next one.
+fn phantom_spaces(glyphs: &[Glyph]) -> Vec<bool> {
+    let visible = |g: &&Glyph| !g.text.trim().is_empty();
+    (0..glyphs.len())
+        .map(|i| {
+            let g = &glyphs[i];
+            if !g.text.trim().is_empty() {
+                return false;
+            }
+            let tol = 0.01 * g.size;
+            let prev = glyphs[..i].iter().rev().find(visible);
+            let next = glyphs[i + 1..].iter().find(visible);
+            prev.is_some_and(|p| is_ligature(&p.text) && g.x < p.end - tol)
+                || next.is_some_and(|n| is_ligature(&n.text) && g.end > n.x + tol)
+        })
+        .collect()
+}
+
 fn render_line(glyphs: Vec<Glyph>) -> Option<Line> {
+    let phantom = phantom_spaces(&glyphs);
     let visible: Vec<&Glyph> = glyphs
         .iter()
         .filter(|g| !g.text.trim().is_empty())
@@ -234,8 +281,17 @@ fn render_line(glyphs: Vec<Glyph>) -> Option<Line> {
     let mut prev_end: Option<f64> = None;
     let mut x0 = f64::MAX;
     let mut x1 = f64::MIN;
-    for g in &glyphs {
+    let mut cells: Vec<(f64, String)> = Vec::new();
+    let mut prev_visible_end: Option<f64> = None;
+    // The glyph before a phantom space often reports a short width too
+    // ("f" + "fi" for "ffi"), so its gap is not a word break either.
+    let mut after_phantom = false;
+    for (i, g) in glyphs.iter().enumerate() {
         if g.text.trim().is_empty() {
+            if phantom[i] {
+                after_phantom = true;
+                continue;
+            }
             if !text.ends_with(' ') && !text.is_empty() {
                 text.push(' ');
             }
@@ -254,13 +310,26 @@ fn render_line(glyphs: Vec<Glyph>) -> Option<Line> {
         }
         if let Some(pe) = prev_end
             && g.x > pe + 0.15 * g.size
+            && !after_phantom
             && !text.ends_with(' ')
             && !text.is_empty()
         {
             text.push(' ');
         }
+        after_phantom = false;
+        let wide_gap = prev_visible_end.is_none_or(|e| g.x - e > CELL_GAP * g.size);
+        match cells.last_mut() {
+            Some(cell) if !wide_gap => {
+                if text.ends_with(' ') && !cell.1.ends_with(' ') {
+                    cell.1.push(' ');
+                }
+                cell.1.push_str(&g.text);
+            }
+            _ => cells.push((g.x, g.text.clone())),
+        }
         text.push_str(&g.text);
         prev_end = Some(g.end);
+        prev_visible_end = Some(g.end);
         x0 = x0.min(g.x);
         x1 = x1.max(g.end);
     }
@@ -275,6 +344,10 @@ fn render_line(glyphs: Vec<Glyph>) -> Option<Line> {
         y: baseline,
         size,
         lead_mark,
+        cells: cells
+            .into_iter()
+            .map(|(x, t)| (x, t.trim().to_string()))
+            .collect(),
     })
 }
 
@@ -358,6 +431,8 @@ fn strip_page_furniture(pages: &mut [Page]) {
     }
     let is_furniture = |l: &Line| {
         PAGE_NUMBER.is_match(&l.text)
+            // Running heads such as "12 Part I ■ Getting Started".
+            || (l.text.contains(['■', '▪']) && l.text.chars().any(|c| c.is_ascii_digit()))
             || seen
                 .get(&normalise_furniture(&l.text))
                 .is_some_and(|c| *c >= 2)
@@ -469,6 +544,7 @@ fn build_blocks(mut pages: Vec<Page>) -> Vec<Block> {
     };
 
     let mut asm = Assembler::default();
+    let mut table: Option<TableRegion> = None;
     for page in &pages {
         let body_lines = page
             .lines
@@ -480,6 +556,41 @@ fn build_blocks(mut pages: Vec<Page>) -> Vec<Block> {
         let mut rules = page.rules.iter().copied().peekable();
 
         for line in &page.lines {
+            // Inside a table, rules separate rows; the table ends at the next
+            // heading, caption or line of running prose.
+            if let Some(t) = table.as_mut() {
+                while rules.next_if(|r| *r < line.y).is_some() {
+                    t.end_row();
+                }
+                let ends = matches!(classify(line), LineClass::Heading(_))
+                    || TABLE_CAPTION.is_match(&line.text)
+                    || FIGURE_CAPTION.is_match(&line.text)
+                    || is_prose(line, left, right)
+                    || t.lines >= MAX_TABLE_LINES;
+                if !ends {
+                    t.add(line);
+                    prev = Some(line);
+                    continue;
+                }
+                let t = table.take().unwrap();
+                asm.push(t.into_block(), page.num);
+            }
+            if matches!(classify(line), LineClass::Body) {
+                if TABLE_CAPTION.is_match(&line.text) {
+                    asm.flush();
+                    table = Some(TableRegion::new(&line.text));
+                    // Rules above the first row are part of the table.
+                    while rules.next_if(|r| *r < line.y).is_some() {}
+                    prev = Some(line);
+                    continue;
+                }
+                if FIGURE_CAPTION.is_match(&line.text) {
+                    asm.flush();
+                    asm.push(Block::new(BlockKind::Figure, line.text.clone()), page.num);
+                    prev = Some(line);
+                    continue;
+                }
+            }
             // A rule lying between two text lines is a scene break.
             if rules.next_if(|r| *r < line.y).is_some() {
                 while rules.next_if(|r| *r < line.y).is_some() {}
@@ -549,7 +660,105 @@ fn build_blocks(mut pages: Vec<Page>) -> Vec<Block> {
         }
     }
     asm.flush();
+    if let Some(t) = table.take() {
+        let page = asm.blocks.last().and_then(|b| b.page).unwrap_or(0);
+        asm.push(t.into_block(), page);
+    }
+    for b in &mut asm.blocks {
+        if b.is_heading() {
+            b.text = normalise_heading(&b.text);
+        }
+    }
     asm.blocks
+}
+
+/// "C H A P T E R: 1: Dive In" -> "Chapter 1: Dive In".
+fn normalise_heading(text: &str) -> String {
+    let joined = LETTER_SPACED.replace_all(text, |c: &regex::Captures| c[0].replace(' ', ""));
+    match NUMBERED_HEADING.captures(&joined) {
+        Some(c) => {
+            let label = c[1].to_lowercase();
+            let label = label[..1].to_uppercase() + &label[1..];
+            let rest = joined[c[0].len()..].trim();
+            if rest.is_empty() {
+                format!("{label} {}", &c[2])
+            } else {
+                format!("{label} {}: {rest}", &c[2])
+            }
+        }
+        None => joined.into_owned(),
+    }
+}
+
+/// A full-width line of ordinary running text (no column gaps): the end of
+/// a table region.
+fn is_prose(line: &Line, left: f64, right: f64) -> bool {
+    line.cells.len() <= 1
+        && line.x0 <= left + 1.0 * line.size
+        && line.x1 >= right - 3.0 * line.size
+        && line.text.chars().count() >= 50
+}
+
+/// Lines collected after a "Table N-N: caption" line. Rules split rows;
+/// cells are placed in columns by their x position.
+struct TableRegion {
+    caption: String,
+    rows: Vec<String>,
+    /// Columns (x, text) of the row being collected.
+    row: Vec<(f64, String)>,
+    lines: usize,
+}
+
+impl TableRegion {
+    fn new(caption: &str) -> Self {
+        Self {
+            caption: caption.trim().to_string(),
+            rows: Vec::new(),
+            row: Vec::new(),
+            lines: 0,
+        }
+    }
+
+    fn add(&mut self, line: &Line) {
+        self.lines += 1;
+        for (x, text) in &line.cells {
+            let tol = 1.0 * line.size;
+            match self.row.iter_mut().find(|(cx, _)| (cx - x).abs() <= tol) {
+                Some((_, cell)) => {
+                    let hyphenated = cell.ends_with('-')
+                        && cell.chars().rev().nth(1).is_some_and(char::is_alphabetic)
+                        && text.starts_with(|c: char| c.is_lowercase());
+                    if hyphenated {
+                        cell.pop();
+                    } else {
+                        cell.push(' ');
+                    }
+                    cell.push_str(text);
+                }
+                None => self.row.push((*x, text.clone())),
+            }
+        }
+    }
+
+    fn end_row(&mut self) {
+        if self.row.is_empty() {
+            return;
+        }
+        self.row.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let cells: Vec<&str> = self.row.iter().map(|(_, t)| t.as_str()).collect();
+        self.rows.push(cells.join(" | "));
+        self.row.clear();
+    }
+
+    fn into_block(mut self) -> Block {
+        self.end_row();
+        let mut text = self.caption;
+        for r in self.rows {
+            text.push('\n');
+            text.push_str(&r);
+        }
+        Block::new(BlockKind::Table, text)
+    }
 }
 
 fn ends_sentence(text: &str) -> bool {
@@ -693,7 +902,8 @@ fn read_outline(doc: &pdf_extract::Document) -> Vec<TocEntry> {
     let min_level = toc.iter().map(|t| t.level).min().unwrap_or(1);
     toc.into_iter()
         .map(|t| TocEntry {
-            title: super::collapse_ws(&t.title),
+            // Outline strings are often NUL-padded UTF-16.
+            title: super::collapse_ws(&t.title.replace(char::is_control, " ")),
             level: (t.level - min_level + 1).min(u8::MAX as usize) as u8,
             target: TocTarget::Page(t.page as u32),
         })
@@ -712,7 +922,130 @@ mod tests {
             y,
             size,
             lead_mark: text.starts_with(|c: char| c.is_ascii_digit()),
+            cells: vec![(x0, text.into())],
         }
+    }
+
+    /// A table line: cells at the given x positions.
+    fn row(cells: &[(&str, f64)], y: f64) -> Line {
+        let text = cells.iter().map(|c| c.0).collect::<Vec<_>>().join(" ");
+        let last = cells.last().unwrap();
+        Line {
+            text,
+            x0: cells[0].1,
+            x1: last.1 + last.0.len() as f64 * 5.0,
+            y,
+            size: 10.0,
+            lead_mark: false,
+            cells: cells.iter().map(|(t, x)| (*x, t.to_string())).collect(),
+        }
+    }
+
+    fn glyphs(spec: &[(&str, f64, f64)]) -> Vec<Glyph> {
+        spec.iter()
+            .map(|(t, x, end)| Glyph {
+                x: *x * 10.0,
+                y: 100.0,
+                end: *end * 10.0,
+                size: 10.0,
+                text: t.to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ignores_spaces_overlapping_ligatures() {
+        // Positions in ems, as measured in a Wiley PDF.
+        let line = render_line(glyphs(&[
+            ("o", 17.0, 17.5),
+            ("fi", 17.5, 18.1),
+            (" ", 17.8, 18.05),
+            ("n", 18.1, 18.6),
+            ("g", 18.6, 19.1),
+            (" ", 19.1, 19.35),
+            ("a", 19.35, 19.85),
+            ("f", 20.0, 20.33),
+            (" ", 20.33, 20.58),
+            ("fi", 20.54, 21.14),
+            ("x", 21.14, 21.6),
+        ]))
+        .unwrap();
+        assert_eq!(line.text, "ofing affix");
+    }
+
+    #[test]
+    fn splits_wide_gaps_into_cells() {
+        let line = render_line(glyphs(&[
+            ("a", 1.0, 1.5),
+            (" ", 1.5, 1.75),
+            ("b", 1.75, 2.25),
+            ("c", 6.0, 6.5),
+        ]))
+        .unwrap();
+        assert_eq!(line.text, "a b c");
+        assert_eq!(
+            line.cells,
+            vec![(10.0, "a b".to_string()), (60.0, "c".to_string())]
+        );
+    }
+
+    #[test]
+    fn normalises_letter_spaced_chapter_headings() {
+        assert_eq!(
+            normalise_heading("C H A P T E R: 1: Dive In and Model!"),
+            "Chapter 1: Dive In and Model!"
+        );
+        assert_eq!(
+            normalise_heading("PART II Finding Things"),
+            "Part II: Finding Things"
+        );
+        assert_eq!(normalise_heading("Part Two"), "Part Two");
+        assert_eq!(normalise_heading("Appendix A Tools"), "Appendix A: Tools");
+        assert_eq!(
+            normalise_heading("A Plan for Testing"),
+            "A Plan for Testing"
+        );
+    }
+
+    #[test]
+    fn collects_tables_and_figures() {
+        let full = "x".repeat(80);
+        let pages = vec![Page {
+            num: 1,
+            height: 800.0,
+            rules: vec![130.0, 160.0, 200.0],
+            lines: vec![
+                line(&format!("Intro {full}"), 100.0, 100.0, 10.0),
+                line("Table 2-1: Some Things", 100.0, 112.0, 10.0),
+                row(&[("THING", 100.0), ("NOTES", 300.0)], 124.0),
+                row(
+                    &[("Tampering with a", 100.0), ("Hard to defend", 300.0)],
+                    136.0,
+                ),
+                row(&[("file", 100.0), ("once authen-", 300.0)], 148.0),
+                row(&[("tication fails", 300.0)], 152.0),
+                row(&[("Spoofing", 100.0), ("Easy", 300.0)], 172.0),
+                line(&format!("After the table {full}"), 100.0, 212.0, 10.0),
+                line("Figure 2-1: A diagram", 100.0, 224.0, 10.0),
+                line(&format!("More text {full}"), 100.0, 236.0, 10.0),
+            ],
+        }];
+        let blocks = build_blocks(pages);
+        let got: Vec<(BlockKind, &str)> =
+            blocks.iter().map(|b| (b.kind, b.text.as_str())).collect();
+        assert_eq!(got.len(), 5, "{got:?}");
+        assert_eq!(
+            got[1],
+            (
+                BlockKind::Table,
+                "Table 2-1: Some Things
+THING | NOTES
+Tampering with a file | Hard to defend once authentication fails
+Spoofing | Easy"
+            )
+        );
+        assert_eq!(got[2].0, BlockKind::Paragraph);
+        assert_eq!(got[3], (BlockKind::Figure, "Figure 2-1: A diagram"));
     }
 
     #[test]

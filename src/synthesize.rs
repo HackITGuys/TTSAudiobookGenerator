@@ -616,6 +616,7 @@ mod tests {
                 authors: vec!["Ingrid Solberg".into()],
                 ..Default::default()
             },
+            text_stage: None,
             chapters,
             tts: None,
             credits: None,

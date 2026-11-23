@@ -26,10 +26,20 @@ pub struct BookMetadata {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BlockKind {
-    Heading { level: u8 },
+    Heading {
+        level: u8,
+    },
     Paragraph,
-    ListItem { ordered: bool, index: u32 },
+    ListItem {
+        ordered: bool,
+        index: u32,
+    },
     SceneBreak,
+    /// A table. The block text is the caption on the first line, then one
+    /// line per row (cells separated by ` | `).
+    Table,
+    /// A figure; the block text is its caption.
+    Figure,
 }
 
 /// A unit of document text with enough positional information to map
@@ -139,6 +149,12 @@ pub struct Chapter {
     pub text_file: Option<String>,
     /// SSML file, relative to the book output dir.
     pub ssml_file: Option<String>,
+    /// Deterministically extracted Markdown (`raw/`), relative to the book dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_file: Option<String>,
+    /// LLM-repaired, hand-editable Markdown (`text/`), relative to the book dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refined_file: Option<String>,
     pub segments: Vec<Segment>,
     #[serde(skip)]
     pub blocks: Vec<Block>,
@@ -157,6 +173,8 @@ impl Chapter {
             est_duration_secs: (word_count as f64 / NARRATION_WPM * 60.0).round() as u32,
             text_file: None,
             ssml_file: None,
+            raw_file: None,
+            refined_file: None,
             segments: Vec::new(),
             blocks,
         }
@@ -168,6 +186,11 @@ pub struct Book {
     pub generator: String,
     pub source_file: String,
     pub metadata: BookMetadata,
+    /// Which text the segments were built from: `raw` (extraction only),
+    /// `partial` (some chapters refined) or `refined` (every chapter repaired
+    /// by `refine`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_stage: Option<String>,
     pub chapters: Vec<Chapter>,
     /// Voice settings used for the audio, once synthesised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
